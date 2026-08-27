@@ -19,10 +19,10 @@ use cranelift_codegen::{
     Reg, Writable,
     ir::{MemFlagsData, types::I8},
     isa::aarch64::inst::{
-        ALUOp, ALUOp3, AMode, ASIMDFPModImm, ASIMDMovModImm, BitOp, Cond, ExtendOp,
+        ALUOp, ALUOp3, AMode, ASIMDFPModImm, ASIMDMovModImm, BfmOp, BitOp, Cond, ExtendOp,
         FPULeftShiftImm, FPUOp1, FPUOp2, FPUOpRI, FPUOpRIMod, FPURightShiftImm, FpuRoundMode,
         FpuToIntOp, Imm12, Inst, IntToFpuOp, MoveWideConst, MoveWideOp, NZCV, OperandSize, SImm9,
-        ScalarSize, ShiftOp, ShiftOpAndAmt, ShiftOpShiftImm, UImm5, UImm12Scaled, VecALUOp,
+        ScalarSize, ShiftOp, ShiftOpAndAmt, ShiftOpShiftImm, UImm5, UImm6, UImm12Scaled, VecALUOp,
         VecLanesOp, VecMisc2, VectorSize, vreg, writable_vreg, writable_xreg, xreg,
     },
 };
@@ -80,6 +80,10 @@ pub fn define() -> Result<Vec<FileConfig>> {
         FileConfig {
             name: "extend.isle".into(),
             specs: vec![define_extend()],
+        },
+        FileConfig {
+            name: "bitfield_move.isle".into(),
+            specs: vec![define_bitfield_move()?],
         },
         FileConfig {
             name: "conds.isle".into(),
@@ -830,6 +834,158 @@ fn define_extend() -> SpecConfig {
                 .collect(),
         ),
     }
+}
+
+fn define_bitfield_move() -> Result<SpecConfig> {
+    let sizes = [OperandSize::Size32, OperandSize::Size64];
+    let bfm_ops = [BfmOp::UBfm, BfmOp::SBfm];
+
+    Ok(SpecConfig {
+        term: "MInst.BitfieldMove".to_string(),
+        args: ["size", "bfm_op", "rd", "rn", "immr", "imms"]
+            .map(String::from)
+            .to_vec(),
+        cases: Cases::Match(Match {
+            on: spec_var("bfm_op".to_string()),
+            arms: bfm_ops
+                .iter()
+                .map(|bfm_op| {
+                    let mut cases = Vec::new();
+                    for size in sizes.iter().rev() {
+                        // 32-bit BFM is UNDEFINED when bit 5 of `immr` or
+                        // `imms` is set, so only 5 bits of each are usable.
+                        let imm_width = match size {
+                            OperandSize::Size32 => 5,
+                            OperandSize::Size64 => 6,
+                        };
+                        for imms in 0..(1u8 << imm_width) {
+                            cases.push(bitfield_move_case(*size, *bfm_op, imms, imm_width)?);
+                        }
+                    }
+                    Ok(Arm {
+                        variant: format!("{bfm_op:?}"),
+                        args: Vec::new(),
+                        body: Cases::Cases(cases),
+                    })
+                })
+                .collect::<Result<_>>()?,
+        }),
+    })
+}
+
+/// One case of `BitfieldMove`, for a concrete `imms` and symbolic `immr`.
+///
+/// `imms` must be concrete: the ASL decode computes the bitfield width via
+/// `DecodeBitMasks`, whose `Ones(...)` widths derive from `imms`. Left
+/// symbolic, ASLp emits an `ones_bits` with a symbolic width, which has no
+/// fixed-width bit vector representation.
+fn bitfield_move_case(
+    size: OperandSize,
+    bfm_op: BfmOp,
+    imms: u8,
+    imm_width: usize,
+) -> Result<Case> {
+    /// Width of the `UImm6` model, in bits.
+    static UIMM6_WIDTH: usize = 6;
+
+    // Execution scope: define opcode template fields.
+    let mut scope = aarch64::state();
+    let immr_field = Target::Var("immr".to_string());
+    scope.global(immr_field.clone());
+
+    // Register mappings.
+    let mut mappings = Mappings::default();
+    mappings.writes.insert(
+        aarch64::gpreg(4),
+        Mapping::require(spec_var("rd".to_string())),
+    );
+    mappings.reads.insert(
+        aarch64::gpreg(5),
+        Mapping::require(spec_as_bit_vector_width(spec_var("rn".to_string()), 64)),
+    );
+
+    let mut conds = vec![
+        spec_discriminator(format!("{size:?}"), spec_var("size".to_string())),
+        spec_eq(
+            spec_var("imms".to_string()),
+            spec_const_bit_vector(imms.into(), UIMM6_WIDTH),
+        ),
+    ];
+
+    // Symbolic `immr`. When the encoded field is narrower than the `UImm6`
+    // model, map the low bits and require the excess high bits are zero.
+    let immr_model = spec_var("immr".to_string());
+    if imm_width < UIMM6_WIDTH {
+        mappings.reads.insert(
+            immr_field,
+            Mapping::require(spec_extract(imm_width - 1, 0, immr_model.clone())),
+        );
+        conds.push(spec_eq(
+            spec_extract(UIMM6_WIDTH - 1, imm_width, immr_model),
+            spec_const_bit_vector(0, UIMM6_WIDTH - imm_width),
+        ));
+    } else {
+        mappings
+            .reads
+            .insert(immr_field, Mapping::require(immr_model));
+    }
+
+    let template =
+        bitfield_move_template(size, bfm_op, writable_xreg(4), xreg(5), imms, imm_width)?;
+
+    Ok(Case {
+        conds,
+        cases: Cases::Instruction(InstConfig {
+            opcodes: Opcodes::Template(template),
+            scope,
+            mappings,
+        }),
+    })
+}
+
+fn bitfield_move_template(
+    size: OperandSize,
+    bfm_op: BfmOp,
+    rd: Writable<Reg>,
+    rn: Reg,
+    imms: u8,
+    imm_width: usize,
+) -> Result<Bits> {
+    // Assemble a base instruction with the concrete `imms` and a zero
+    // placeholder for `immr`. The placeholder leaves bit 21 zero, which is
+    // required by the 32-bit encoding and untouched by the 5-bit splice.
+    let imms = UImm6::maybe_from_u8(imms).unwrap();
+    let base = Inst::BitfieldMove {
+        size,
+        bfm_op,
+        rd,
+        rn,
+        immr: UImm6 { imm: 0 },
+        imms,
+    };
+    let opcode = aarch64::opcode(&base);
+    let bits = Bits::from_u32(opcode);
+
+    // Splice in the symbolic `immr` field.
+    let immr = Bits {
+        segments: vec![Segment::Symbolic("immr".to_string(), imm_width)],
+    };
+    let template = Bits::splice(&bits, &immr, 16)?;
+
+    // Verify template against the assembler.
+    verify_opcode_template(&template, |assignment: &HashMap<String, u32>| {
+        let immr = *assignment.get("immr").unwrap();
+        Ok(Inst::BitfieldMove {
+            size,
+            bfm_op,
+            rd,
+            rn,
+            immr: UImm6::maybe_from_u8(immr as u8).unwrap(),
+            imms,
+        })
+    })?;
+
+    Ok(template)
 }
 
 fn define_loads() -> Result<Vec<SpecConfig>> {
